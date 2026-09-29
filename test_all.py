@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SNI Host Finder PRO — Unified Full Test Suite v2.0
+SNI Host Finder PRO — Unified Full Test Suite v2.1
 SOUTH AFRICA EDITION — Optimized for MTN & Vodacom (also Telkom, Cell C)
 
 Tests ONE or MULTIPLE hosts with ALL methods:
@@ -18,7 +18,7 @@ Output:
   🟡 YELLOW = Medium chance
   🔴 RED    = Low chance / skip
 
-Auto-cleans dirty pasted text (descriptions, protocols, paths, etc.)
+Auto-extracts domains even from messy jammed text.
 Concurrent multi-host testing with rate limiting.
 """
 
@@ -34,7 +34,6 @@ import concurrent.futures
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 
-# Optional but recommended
 try:
     from colorama import Fore, Style, init
     init(autoreset=True)
@@ -53,13 +52,13 @@ except ImportError:
     HAS_DNS = False
 
 # ============ PATHS ============
-RESULTS_DIR = os.path.expanduser("~/snihost_pro/results")
-CONFIG_DIR = os.path.expanduser("~/snihost_pro/configs")
+RESULTS_DIR = os.path.expanduser("\~/snihost_pro/results")
+CONFIG_DIR = os.path.expanduser("\~/snihost_pro/configs")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 os.makedirs(CONFIG_DIR, exist_ok=True)
 
-PERSONAL_DB = os.path.expanduser("~/snihost_pro/my_zero_rated_hosts.json")
-COMMUNITY_DB = os.path.expanduser("~/snihost_pro/community/local_intel.json")
+PERSONAL_DB = os.path.expanduser("\~/snihost_pro/my_zero_rated_hosts.json")
+COMMUNITY_DB = os.path.expanduser("\~/snihost_pro/community/local_intel.json")
 
 # ============ SA ISP CONFIG (MTN & Vodacom prioritized) ============
 SA_ISP_CONFIG = {
@@ -109,79 +108,121 @@ SA_ISP_CONFIG = {
     }
 }
 
-# Known CDN ranges (penalized heavily by SA ISPs)
 CDN_RANGES = [
-    ('104.16.0.0', '104.31.255.255'),   # Cloudflare
-    ('172.64.0.0', '172.71.255.255'),   # Cloudflare
-    ('13.32.0.0', '13.35.255.255'),     # AWS
-    ('52.84.0.0', '52.85.255.255'),     # AWS
-    ('54.192.0.0', '54.207.255.255'),   # AWS
-    ('151.101.0.0', '151.101.255.255'), # Fastly
-    ('23.32.0.0', '23.63.255.255'),     # Akamai
-    ('157.52.64.0', '157.52.127.255'),  # Fastly
+    ('104.16.0.0', '104.31.255.255'),
+    ('172.64.0.0', '172.71.255.255'),
+    ('13.32.0.0', '13.35.255.255'),
+    ('52.84.0.0', '52.85.255.255'),
+    ('54.192.0.0', '54.207.255.255'),
+    ('151.101.0.0', '151.101.255.255'),
+    ('23.32.0.0', '23.63.255.255'),
+    ('157.52.64.0', '157.52.127.255'),
 ]
 
-# ============ HOST CLEANER ============
+# ============ SMART HOST EXTRACTOR ============
 
 def clean_host_line(line: str) -> Optional[str]:
-    """Aggressively clean dirty pasted lines."""
-    if not line or not isinstance(line, str):
-        return None
-    line = str(line).strip()
-    if not line or line.startswith('#') or line.startswith('//'):
-        return None
+    hosts = extract_all_hosts(line)
+    return hosts[0] if hosts else None
 
-    # 1. Strip protocols FIRST (before colon stripping)
-    line = re.sub(r'(?i)^(https?://|http://)', '', line)
-    line = re.sub(r'(?i)^www\.', '', line)
 
-    # 2. Remove paths
-    line = line.split('/')[0]
+def extract_all_hosts(text: str) -> List[str]:
+    """
+    Aggressively extract ALL valid domains from any messy text.
+    Handles jammed formats like:
+      DUT Moodlehttps://tlzprod.dut.ac.za/DUT Websitehttps://www.dut.ac.za/
+    """
+    if not text or not isinstance(text, str):
+        return []
 
-    # 3. Remove descriptions in parentheses/brackets
-    line = re.sub(r'\s*[\(\[\{].*?[\)\]\}]\s*', '', line)
+    found = []
+    seen = set()
 
-    # 4. Remove everything after dash / pipe / bullet
-    line = re.sub(r'\s*[-|–—•·]\s*.*$', '', line)
+    # Strategy 1: Extract from http(s):// patterns
+    url_re = re.compile(
+        r'https?://(?:www\.)?([a-zA-Z0-9](?:[-a-zA-Z0-9]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[-a-zA-Z0-9]{0,61}[a-zA-Z0-9])?)+)',
+        re.IGNORECASE
+    )
+    for m in url_re.finditer(text):
+        domain = m.group(1).lower().rstrip('.')
+        domain = _trim_domain(domain)
+        if _is_valid_domain(domain) and domain not in seen:
+            seen.add(domain)
+            found.append(domain)
 
-    # 5. Remove "host: description" style (now safe because protocol gone)
-    line = re.sub(r'\s*:\s*.*$', '', line)
+    # Strategy 2: Loose domain patterns
+    loose_re = re.compile(
+        r'(?:^|[^a-zA-Z0-9.-])(?:www\.)?([a-zA-Z0-9](?:[-a-zA-Z0-9]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z]{2,}){1,4})(?=[^a-zA-Z0-9.-]|$)',
+        re.IGNORECASE
+    )
+    for m in loose_re.finditer(text):
+        domain = m.group(1).lower().rstrip('.')
+        domain = _trim_domain(domain)
+        if _is_valid_domain(domain) and domain not in seen:
+            seen.add(domain)
+            found.append(domain)
 
-    # 6. Remove common trailing words
-    line = re.sub(r'(?i)\s+(working|dead|tested|good|bad|mtn|vodacom|free|zero|host).*$', '', line)
+    found.sort(key=lambda d: (-d.count('.'), d))
+    return found
 
-    # 7. Remove port
-    line = re.sub(r':\d+$', '', line)
 
-    # 8. Final cleanup
-    line = re.sub(r'\s+', '', line)
-    line = line.strip('.,;|"\'')
+def _trim_domain(domain: str) -> str:
+    bad_suffixes = [
+        'dut', 'moodle', 'website', 'libraries', 'libguides', 'libchat',
+        'portal', 'mobile', 'journals', 'catalogue', 'login', 'index',
+        'html', 'htm', 'php', 'asp', 'aspx', 'jsp'
+    ]
+    lower = domain.lower()
+    for suf in bad_suffixes:
+        if lower.endswith(suf) and '.' in lower[:-len(suf)]:
+            candidate = domain[:-len(suf)]
+            if _is_valid_domain(candidate):
+                return candidate
+    domain = re.sub(r'\.(html?|php|asp|aspx|jsp)$', '', domain, flags=re.I)
+    return domain
 
-    if not re.match(r'^[a-zA-Z0-9][-a-zA-Z0-9.]*[a-zA-Z0-9]$', line):
-        return None
-    if '.' not in line:
-        return None
 
-    line = line.rstrip('.').lower()
-    parts = line.split('.')
-    if len(parts) < 2 or len(parts[-1]) < 2:
-        return None
-    return line
+def _is_valid_domain(domain: str) -> bool:
+    if not domain or len(domain) < 4 or len(domain) > 253:
+        return False
+    if domain.count('.') < 1:
+        return False
+    if not re.match(r'^[a-zA-Z0-9][-a-zA-Z0-9.]*[a-zA-Z0-9]$', domain):
+        return False
+    parts = domain.split('.')
+    if len(parts) < 2:
+        return False
+    tld = parts[-1].lower()
+    ALLOWED_TLDS = {
+        'com', 'org', 'net', 'edu', 'gov', 'ac', 'za', 'co', 'info', 'biz',
+        'io', 'app', 'dev', 'me', 'tv', 'cc', 'us', 'uk', 'ng', 'ke', 'gh',
+        'africa', 'school', 'museum', 'name', 'pro', 'mil', 'int'
+    }
+    if tld not in ALLOWED_TLDS:
+        if len(parts) >= 3 and parts[-2].lower() in ALLOWED_TLDS:
+            pass
+        else:
+            return False
+    if re.match(r'^\d+\.\d+\.\d+\.\d+$', domain):
+        return False
+    if domain in ('example.com', 'test.com', 'localhost') or tld in (
+        'html', 'htm', 'php', 'asp', 'js', 'css', 'jpg', 'png', 'gif', 'pdf'
+    ):
+        return False
+    for label in parts:
+        if len(label) == 0 or len(label) > 63:
+            return False
+        if label.startswith('-') or label.endswith('-'):
+            return False
+    return True
 
 
 def clean_hosts_bulk(text_or_list) -> List[str]:
-    if isinstance(text_or_list, str):
-        raw = re.split(r'[\n\r,;|]+', text_or_list)
+    if isinstance(text_or_list, list):
+        text = '\n'.join(str(x) for x in text_or_list)
     else:
-        raw = text_or_list
-    cleaned = []
-    seen = set()
-    for line in raw:
-        h = clean_host_line(line)
-        if h and h not in seen:
-            seen.add(h)
-            cleaned.append(h)
-    return cleaned
+        text = str(text_or_list)
+    return extract_all_hosts(text)
 
 
 # ============ DNS & IP HELPERS ============
@@ -259,7 +300,7 @@ def test_empty_sni(host: str, timeout: float = 4.0) -> Dict:
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         with socket.create_connection((host, 443), timeout=timeout) as sock:
-            with ctx.wrap_socket(sock) as ssock:  # no server_hostname
+            with ctx.wrap_socket(sock) as ssock:
                 return {'accepts_empty_sni': True, 'tls_version': ssock.version()}
     except:
         return {'accepts_empty_sni': False}
@@ -278,7 +319,6 @@ def test_wrong_sni(host: str, wrong: str = 'google.com', timeout: float = 4.0) -
 
 
 def test_mtn_tunnel_risk(host: str, timeout: float = 4.0) -> Dict:
-    """MTN explicitly bans tunneling. Score how 'tunnel-like' the handshake looks."""
     try:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
@@ -298,11 +338,9 @@ def test_mtn_tunnel_risk(host: str, timeout: float = 4.0) -> Dict:
 
 
 def test_vodacom_strict(host: str, timeout: float = 4.0) -> Dict:
-    """Vodacom likes IP + Port + SNI to match cleanly."""
     basic = test_tls_handshake(host, sni=host, timeout=timeout)
     if not basic['success']:
         return {'vodacom_compatible': False, 'reason': 'handshake failed'}
-    # If we got a proper cert with the host in SANs, good sign
     sans = basic.get('cert_sans', [])
     host_in_sans = any(host in s or s in host for s in sans) or not sans
     return {
@@ -312,13 +350,9 @@ def test_vodacom_strict(host: str, timeout: float = 4.0) -> Dict:
     }
 
 
-# ============ HTTP CUSTOM HOST HEADER (for HTTP Injector / HA Tunnel) ============
+# ============ HTTP CUSTOM HOST HEADER ============
 
 def test_http_custom_header(host: str, timeout: float = 5.0) -> Dict:
-    """
-    Test whether the host accepts a custom Host header.
-    Critical for HTTP Injector, HA Tunnel Plus, NapsternetV HTTP methods.
-    """
     results = {
         'https_host_header_ok': False,
         'http_host_header_ok': False,
@@ -326,8 +360,6 @@ def test_http_custom_header(host: str, timeout: float = 5.0) -> Dict:
         'status_http': None,
         'score': 0
     }
-
-    # HTTPS with Host header
     try:
         conn = http.client.HTTPSConnection(host, timeout=timeout, context=ssl._create_unverified_context())
         conn.request("GET", "/", headers={
@@ -342,8 +374,6 @@ def test_http_custom_header(host: str, timeout: float = 5.0) -> Dict:
         conn.close()
     except:
         pass
-
-    # Plain HTTP with Host header
     try:
         conn = http.client.HTTPConnection(host, timeout=timeout)
         conn.request("GET", "/", headers={
@@ -482,7 +512,7 @@ def get_isp_bonus(host: str, isp: str, category: str, is_static: bool) -> Tuple[
 
 
 def get_dpi_score(tls: Dict, http_hdr: Dict, content: Dict, dns: Dict, isp: str) -> int:
-    score = 50  # base
+    score = 50
     if tls.get('accepts_empty_sni'):
         score += 8
     if tls.get('accepts_wrong_sni'):
@@ -510,12 +540,11 @@ def calculate_final(tls_score: int, http_score: int, content_score: int,
     weights = SA_ISP_CONFIG.get(isp.lower(), {}).get('score_weights', {
         'tls': 0.28, 'http_header': 0.18, 'content': 0.22, 'isp': 0.18, 'dpi': 0.14
     })
-    # Normalize components roughly to 0-100
     final = (
         tls_score * weights.get('tls', 0.28) +
         http_score * weights.get('http_header', 0.18) +
-        content_score * weights.get('content', 0.22) * 1.6 +   # content is 0-60
-        isp_bonus * weights.get('isp', 0.18) * 2.0 +           # isp is 0-50
+        content_score * weights.get('content', 0.22) * 1.6 +
+        isp_bonus * weights.get('isp', 0.18) * 2.0 +
         dpi * weights.get('dpi', 0.14)
     )
     return max(0, min(100, int(round(final))))
@@ -566,7 +595,7 @@ def run_all_tls_tests(host: str, isp: str = '') -> Dict:
     mtn = test_mtn_tunnel_risk(host) if isp.lower() == 'mtn' else {}
     voda = test_vodacom_strict(host) if isp.lower() == 'vodacom' else {}
 
-    score = 25  # base for successful handshake
+    score = 25
     reasons = ['TLS OK']
 
     ver = basic.get('tls_version', '')
@@ -635,7 +664,6 @@ def test_single_host(host: str, isp: str = '', country: str = 'South Africa',
 
     category = guess_category(host)
 
-    # 1. DNS
     if verbose:
         print(f"\n  {Fore.CYAN}[1/6] DNS Resolution{Style.RESET_ALL}")
     dns = resolve_dns(host)
@@ -645,7 +673,6 @@ def test_single_host(host: str, isp: str = '', country: str = 'South Africa',
         static = dns.get('is_static', False)
         print(f"      Type : {Fore.GREEN if static else Fore.YELLOW}{'STATIC (good)' if static else 'CDN / Dynamic'}{Style.RESET_ALL}")
 
-    # 2. Deep TLS
     if verbose:
         print(f"\n  {Fore.CYAN}[2/6] Deep TLS / SSL Tests{Style.RESET_ALL}")
     tls = run_all_tls_tests(host, isp)
@@ -677,7 +704,6 @@ def test_single_host(host: str, isp: str = '', country: str = 'South Africa',
             print(f"      Vodacom   : {Fore.GREEN if ok else Fore.RED}{'COMPATIBLE' if ok else 'STRICT FAIL'}{Style.RESET_ALL}")
         print(f"      TLS Score  : {tls['score']}%")
 
-    # 3. HTTP Custom Host Header
     if verbose:
         print(f"\n  {Fore.CYAN}[3/6] HTTP Custom Host Header{Style.RESET_ALL}")
     http_hdr = test_http_custom_header(host)
@@ -686,7 +712,6 @@ def test_single_host(host: str, isp: str = '', country: str = 'South Africa',
         print(f"      HTTP Host  : {Fore.GREEN if http_hdr['http_host_header_ok'] else Fore.RED}{'OK' if http_hdr['http_host_header_ok'] else 'FAIL'} ({http_hdr.get('status_http')}){Style.RESET_ALL}")
         print(f"      Header Score: {http_hdr['score']}%")
 
-    # 4. Content
     if verbose:
         print(f"\n  {Fore.CYAN}[4/6] Content Legitimacy ({category}){Style.RESET_ALL}")
     content = verify_content(host, category)
@@ -695,7 +720,6 @@ def test_single_host(host: str, isp: str = '', country: str = 'South Africa',
         print(f"      Matches   : {content.get('keyword_matches', 0)} keywords")
         print(f"      Score     : {leg}%  {'✅' if content.get('looks_legitimate') else '❌'}")
 
-    # 5. ISP rules
     if verbose:
         print(f"\n  {Fore.CYAN}[5/6] ISP Rules ({isp or 'generic'}){Style.RESET_ALL}")
     isp_bonus, isp_reason = get_isp_bonus(host, isp, category, dns.get('is_static', False))
@@ -703,7 +727,6 @@ def test_single_host(host: str, isp: str = '', country: str = 'South Africa',
         print(f"      Bonus     : +{isp_bonus}")
         print(f"      Reasons   : {isp_reason}")
 
-    # 6. DPI
     if verbose:
         print(f"\n  {Fore.CYAN}[6/6] DPI Evasion Score{Style.RESET_ALL}")
     dpi = get_dpi_score(tls, http_hdr, content, dns, isp)
@@ -784,7 +807,6 @@ def test_multiple_hosts(hosts: List[str], isp: str = '', country: str = 'South A
                     'verdict': 'Error', 'error': str(e)
                 })
 
-    # Ranking table
     results.sort(key=lambda x: x.get('final_score', 0), reverse=True)
 
     print(f"\n{'='*68}")
@@ -803,7 +825,6 @@ def test_multiple_hosts(hosts: List[str], isp: str = '', country: str = 'South A
               f"{r.get('http_score', 0):>3}  "
               f"{r.get('category', '')}")
 
-    # Summary
     green = sum(1 for r in results if r.get('verdict_level') == 'GREEN')
     yellow = sum(1 for r in results if r.get('verdict_level') == 'YELLOW')
     red = sum(1 for r in results if r.get('verdict_level') == 'RED')
@@ -811,7 +832,6 @@ def test_multiple_hosts(hosts: List[str], isp: str = '', country: str = 'South A
           f"{Fore.YELLOW}{yellow} Yellow{Style.RESET_ALL}  |  "
           f"{Fore.RED}{red} Red{Style.RESET_ALL}")
 
-    # Save results
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = os.path.join(RESULTS_DIR, f"test_all_{stamp}.json")
     with open(out_path, 'w') as f:
@@ -827,7 +847,6 @@ def test_multiple_hosts(hosts: List[str], isp: str = '', country: str = 'South A
         }, f, indent=2)
     print(f"\n  Results saved → {out_path}")
 
-    # Offer config generation for top hosts
     top = [r for r in results if r.get('final_score', 0) >= 55][:8]
     if top:
         print(f"\n  {Fore.CYAN}Top candidates ready for config export:{Style.RESET_ALL}")
@@ -843,14 +862,12 @@ def test_multiple_hosts(hosts: List[str], isp: str = '', country: str = 'South A
 # ============ CONFIG GENERATORS ============
 
 def generate_configs(hosts_results: List[Dict], isp: str = ''):
-    """Generate ready-to-use configs for popular Android VPN tools."""
     print(f"\n  Generating configs → {CONFIG_DIR}")
     for r in hosts_results:
         host = r['host']
         score = r.get('final_score', 0)
         safe_name = re.sub(r'[^a-zA-Z0-9._-]', '_', host)
 
-        # 1. TLS Tunnel / SSL method
         tls_cfg = f"""# TLS / SSL Method — {host}
 # Score: {score} | ISP: {isp}
 # Use with: TLS Tunnel, HA Tunnel (SSL), NapsternetV (TLS)
@@ -865,7 +882,6 @@ Payload: (leave empty or use default)
         with open(path, 'w') as f:
             f.write(tls_cfg)
 
-        # 2. HTTP Injector / Custom Header
         http_cfg = f"""# HTTP Custom Header Method — {host}
 # Score: {score} | ISP: {isp}
 # Use with: HTTP Injector, HA Tunnel Plus (HTTP), NapsternetV (HTTP)
@@ -882,7 +898,6 @@ CONNECT [host_port] HTTP/1.1[crlf]Host: {host}[crlf][crlf]
         with open(path, 'w') as f:
             f.write(http_cfg)
 
-        # 3. Simple .sni file
         path = os.path.join(CONFIG_DIR, f"{safe_name}.sni")
         with open(path, 'w') as f:
             f.write(host + "\n")
@@ -895,7 +910,7 @@ CONNECT [host_port] HTTP/1.1[crlf]Host: {host}[crlf][crlf]
 
 def main():
     print(f"\n{Fore.CYAN}{'='*68}{Style.RESET_ALL}")
-    print(f"{Fore.CYAN}  SNI Host Finder PRO — Unified Test Suite v2.0{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}  SNI Host Finder PRO — Unified Test Suite v2.1{Style.RESET_ALL}")
     print(f"{Fore.CYAN}  South Africa Edition  •  MTN & Vodacom focused{Style.RESET_ALL}")
     print(f"{Fore.CYAN}{'='*68}{Style.RESET_ALL}\n")
 
@@ -928,7 +943,6 @@ def main():
         if result.get('final_score', 0) >= 55:
             save = input(f"\n{Fore.GREEN}Save to personal DB + generate configs? (y/n): {Style.RESET_ALL}").strip().lower()
             if save == 'y':
-                # simple personal db append
                 db = []
                 if os.path.exists(PERSONAL_DB):
                     try:
@@ -948,8 +962,8 @@ def main():
                 generate_configs([result], isp)
 
     elif choice == '2':
-        print(f"\n{Fore.YELLOW}Paste hosts (one per line). Descriptions & junk are auto-removed.{Style.RESET_ALL}")
-        print(f"{Fore.YELLOW}Type DONE on a new line when finished:{Style.RESET_ALL}\n")
+        print(f"\n{Fore.YELLOW}Paste hosts (one per line or all jammed together).{Style.RESET_ALL}")
+        print(f"{Fore.YELLOW}Descriptions & junk are auto-removed. Type DONE when finished:{Style.RESET_ALL}\n")
         lines = []
         while True:
             try:
